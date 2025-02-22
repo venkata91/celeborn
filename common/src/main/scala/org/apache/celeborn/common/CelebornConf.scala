@@ -1468,6 +1468,26 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     getSslConfig(AUTO_SSL_ENABLED, module)
   }
 
+  def openSslEnabled(module: String): Boolean = {
+    getSslConfig(OPEN_SSL_ENABLED, module)
+  }
+
+  def openSslPrivateKey(module: String): String = {
+    getSslConfig(OPEN_SSL_PRIVATE_KEY, module)
+  }
+
+  def openSslPrivateKeyPassword(module: String): String = {
+    getSslConfig(OPEN_SSL_PRIVATE_KEY_PASSWORD, module)
+  }
+
+  def openSslKeyPassword(module: String): String = {
+    getSslConfig(OPEN_SSL_KEY_PASSWORD, module)
+  }
+
+  def openSslCertChain(module: String): String = {
+    getSslConfig(OPEN_SSL_CERT_CHAIN, module)
+  }
+
   // //////////////////////////////////////////////////////
   //               Authentication                        //
   // //////////////////////////////////////////////////////
@@ -6025,6 +6045,51 @@ object CelebornConf extends Logging {
         "used for SSL. Given use of self-signed certificate, auto ssl only provides over the wire encryption")
       .booleanConf
       .createWithDefault(false)
+
+  val OPEN_SSL_ENABLED: ConfigEntry[Boolean] =
+    buildConf("celeborn.ssl.<module>.openSslEnabled")
+      .categories("network", "ssl")
+      .version("0.5.0")
+      .internal
+      .doc("Enables OpenSSL for securing wire traffic.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val OPEN_SSL_PRIVATE_KEY: ConfigEntry[String] =
+    buildConf("celeborn.ssl.<module>.openSslPrivateKey")
+      .categories("network", "ssl")
+      .version("0.5.0")
+      .internal
+      .doc("A PKCS#8 private key file in PEM format; can be relative to the current directory")
+      .stringConf
+      .createWithDefault(null)
+
+  val OPEN_SSL_PRIVATE_KEY_PASSWORD: ConfigEntry[String] =
+    buildConf("celeborn.ssl.<module>.openSslPrivateKeyPassword")
+      .categories("network", "ssl")
+      .version("0.5.0")
+      .internal
+      .doc("The password to the private key")
+      .stringConf
+      .createWithDefault(null)
+
+  val OPEN_SSL_KEY_PASSWORD: ConfigEntry[String] =
+    buildConf("celeborn.ssl.<module>.keyPassword")
+      .categories("network", "ssl")
+      .version("0.5.0")
+      .internal
+      .doc("The password to the private key in the key store")
+      .stringConf
+      .createWithDefault(null)
+
+  val OPEN_SSL_CERT_CHAIN: ConfigEntry[String] =
+    buildConf("celeborn.ssl.<module>.certChain")
+      .categories("network", "ssl")
+      .version("0.5.0")
+      .internal
+      .doc("A X.509 certificate chain file in PEM format; can be relative to the current directory")
+      .stringConf
+      .createWithDefault(null)
 
   val SECRET_REDACTION_PATTERN =
     buildConf("celeborn.redaction.regex")

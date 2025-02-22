@@ -183,6 +183,36 @@ public class TransportConf {
     return celebornConf.sslProtocol(module);
   }
 
+  /**
+   * If the OpenSSL implementation is enabled, (if available on host system), requires certChain and
+   * keyFile arguments
+   */
+  public boolean sslOpenSslEnabled() {
+    return celebornConf.openSslEnabled(module);
+  }
+
+  /** A PKCS#8 private key file in PEM format; can be relative to the current directory */
+  public File sslPrivateKey() {
+    String privateKey = celebornConf.openSslPrivateKey(module);
+    return privateKey != null ? new File(privateKey) : null;
+  }
+
+  /** The password to the private key */
+  public String sslPrivateKeyPassword() {
+    return celebornConf.openSslPrivateKeyPassword(module);
+  }
+
+  /** The password to the private key in the key store */
+  public String sslKeyPassword() {
+    return celebornConf.openSslKeyPassword(module);
+  }
+
+  /** A X.509 certificate chain file in PEM format; can be relative to the current directory */
+  public File sslCertChain() {
+    String certChain = celebornConf.openSslCertChain(module);
+    return certChain != null ? new File(certChain) : null;
+  }
+
   /** A comma separated list of ciphers */
   public String[] sslRequestedCiphers() {
     return celebornConf.sslRequestedCiphers(module);
