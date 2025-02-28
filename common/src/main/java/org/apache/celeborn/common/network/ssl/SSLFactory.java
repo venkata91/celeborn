@@ -17,6 +17,7 @@
 
 package org.apache.celeborn.common.network.ssl;
 
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -92,6 +93,17 @@ public class SSLFactory {
   }
 
   private void initNettySslContexts(final Builder b) throws SSLException {
+    // Validate invariants
+    if (b.autoSslEnabled) {
+      // this has been already validated - adding precondition check here since we are going to
+      // overwrite these configs
+      if (null != b.privateKey || null != b.certChain) {
+        throw new IllegalArgumentException(
+            "Private key and cert chain can't be configured for auto ssl for OpenSSL!");
+      }
+      configureAutoSslForOpenSsl(b);
+    }
+
     nettyClientSslContext =
         SslContextBuilder.forClient()
             .sslProvider(getSslProvider(b))
@@ -171,6 +183,18 @@ public class SSLFactory {
       // Now that we have create the self signed cert, update the builder config
       b.keyStore(config.keystoreFile, config.keystorePassword).keyPassword(config.keyPassword);
     } catch (CertificateException | KeyStoreException | IOException | NoSuchAlgorithmException e) {
+      // Unexpected
+      throw new IllegalStateException(
+          "Unable to create self signed certificate for configuring auto ssl", e);
+    }
+  }
+
+  private void configureAutoSslForOpenSsl(Builder b) {
+    try {
+      SelfSignedCertificate ssc = new SelfSignedCertificate();
+      b.privateKey(ssc.privateKey());
+      b.certChain(ssc.certificate());
+    } catch (CertificateException e) {
       // Unexpected
       throw new IllegalStateException(
           "Unable to create self signed certificate for configuring auto ssl", e);
