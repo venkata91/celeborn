@@ -191,9 +191,12 @@ public class SSLFactory {
 
   private void configureAutoSslForOpenSsl(Builder b) {
     try {
+      logger.info("Configuring auto ssl for OpenSSL");
       SelfSignedCertificate ssc = new SelfSignedCertificate();
       b.privateKey(ssc.privateKey());
       b.certChain(ssc.certificate());
+      logger.info("Self signed certificate generated for auto ssl for OpenSSL. Private key {} cert {}",
+          ssc.privateKey(), ssc.certificate());
     } catch (CertificateException e) {
       // Unexpected
       throw new IllegalStateException(
