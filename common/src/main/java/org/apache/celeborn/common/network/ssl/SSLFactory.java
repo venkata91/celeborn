@@ -17,7 +17,6 @@
 
 package org.apache.celeborn.common.network.ssl;
 
-import io.netty.handler.ssl.util.SelfSignedCertificate;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -51,6 +50,7 @@ import io.netty.handler.ssl.OpenSsl;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -195,8 +195,10 @@ public class SSLFactory {
       SelfSignedCertificate ssc = new SelfSignedCertificate();
       b.privateKey(ssc.privateKey());
       b.certChain(ssc.certificate());
-      logger.info("Self signed certificate generated for auto ssl for OpenSSL. Private key {} cert {}",
-          ssc.privateKey(), ssc.certificate());
+      logger.info(
+          "Self signed certificate generated for auto ssl for OpenSSL. Private key {} cert {}",
+          ssc.privateKey(),
+          ssc.certificate());
     } catch (CertificateException e) {
       // Unexpected
       throw new IllegalStateException(
