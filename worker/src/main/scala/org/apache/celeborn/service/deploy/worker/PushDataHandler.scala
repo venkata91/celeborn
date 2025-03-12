@@ -1019,15 +1019,113 @@ class PushDataHandler(val workerSource: WorkerSource) extends BaseMessageHandler
     writeLocalData(Seq(fileWriter), body, shuffleKey, isPrimary, None, writePromise)
     // for primary, send data to replica
     if (location.hasPeer && isPrimary) {
-      // to do
-      Try(Await.result(writePromise.future, Duration.Inf)) match {
-        case Success(result) =>
-          if (result(0) != StatusCode.SUCCESS) {
-            wrappedCallback.onFailure(new CelebornIOException("Write data failed!"))
-          } else {
-            wrappedCallback.onSuccess(ByteBuffer.wrap(Array[Byte]()))
+      // Implementation of replication for Flink MapPartition
+      val peer = location.getPeer
+      
+      // Check if peer is available or not
+      if (unavailablePeers.containsKey(partitionLocationInfo.getWorkerInfo(peer.getUniqueId).orNull) &&
+          System.currentTimeMillis() - unavailablePeers.get(partitionLocationInfo.getWorkerInfo(peer.getUniqueId).orNull) < 
+            conf.workerReplicateFastFailDuration) {
+        logWarning(s"Peer worker ${peer.hostAndPushPort()} is unavailable, " +
+          s"skip PushData replication.")
+        workerSource.incCounter(WorkerSource.REPLICATE_SKIP_UNAVAILABLE_COUNT)
+        
+        // Handle the primary write and return
+        Try(Await.result(writePromise.future, Duration.Inf)) match {
+          case Success(result) =>
+            if (result(0) != StatusCode.SUCCESS) {
+              wrappedCallback.onFailure(new CelebornIOException("Write data failed!"))
+            } else {
+              wrappedCallback.onSuccess(ByteBuffer.wrap(Array[Byte]()))
+            }
+          case Failure(e) => wrappedCallback.onFailure(e)
+        }
+      } else {
+        // Peer is available, do async replication
+        val replicateThread = replicateThreadPool.submit(new Runnable {
+          override def run(): Unit = {
+            try {
+              // Get client to send replicated data
+              val client = try {
+                val shuffleKeyValue = Utils.splitShuffleKey(shuffleKey)
+                val workerInfoOpt = partitionLocationInfo.getWorkerInfo(peer.getUniqueId)
+                workerInfoOpt match {
+                  case Some(worker) =>
+                    if (workerReplicateRandomConnectionEnabled) {
+                      replicateClientFactory.createClient(
+                        worker.host, 
+                        worker.pushPort, 
+                        shuffleKeyValue._1,
+                        RND.nextInt())
+                    } else {
+                      replicateClientFactory.createClient(worker.host, worker.pushPort, shuffleKeyValue._1)
+                    }
+                  case None => 
+                    logWarning(s"Cannot create client to peer ${peer.hostAndPushPort()}, " +
+                      s"worker info for ${peer.getUniqueId} not found")
+                    null
+                }
+              } catch {
+                case e: Exception =>
+                  logWarning(s"Failed to create client to peer ${peer.hostAndPushPort()}", e)
+                  null
+              }
+              if (client == null) {
+                handlePushDataConnectionFail(wrappedCallback, peer)
+                return
+              }
+              
+              // Replicate data to peer
+              client.pushData(
+                new PushData(PartitionLocation.Mode.REPLICA.mode(), 
+                  shuffleKey, 
+                  peer.getUniqueId, 
+                  pushData.body),
+                3000, // timeout ms for sync call
+                new RpcResponseCallback {
+                  override def onSuccess(response: ByteBuffer): Unit = {
+                    logDebug(s"Successfully replicated push data for shuffleKey $shuffleKey " +
+                      s"partitionId ${peer.getUniqueId}")
+                  }
+                  
+                  override def onFailure(e: Throwable): Unit = {
+                    logWarning(s"Failed to replicate push data to ${peer.hostAndPushPort()} " +
+                      s"for shuffleKey $shuffleKey partitionId ${peer.getUniqueId}", e)
+                    workerSource.incCounter(WorkerSource.REPLICATE_REMOTE_FAILED_COUNT)
+                    
+                    // Mark peer as unavailable
+                    val workerInfoOpt = partitionLocationInfo.getWorkerInfo(peer.getUniqueId)
+                    workerInfoOpt.foreach { worker =>
+                      unavailablePeers.put(worker, System.currentTimeMillis())
+                    }
+                  }
+                }, null)
+            } catch {
+              case e: Exception =>
+                logWarning(s"Failed to replicate push data to ${peer.hostAndPushPort()} " +
+                  s"for shuffleKey $shuffleKey partitionId ${peer.getUniqueId}", e)
+                workerSource.incCounter(WorkerSource.REPLICATE_REMOTE_FAILED_COUNT)
+                
+                // Mark peer as unavailable
+                val workerInfoOpt = partitionLocationInfo.getWorkerInfo(peer.getUniqueId)
+                workerInfoOpt.foreach { worker =>
+                  unavailablePeers.put(worker, System.currentTimeMillis())
+                }
+            }
           }
-        case Failure(e) => wrappedCallback.onFailure(e)
+        })
+        
+        // Wait for the primary write to complete and respond
+        Try(Await.result(writePromise.future, Duration.Inf)) match {
+          case Success(result) =>
+            if (result(0) != StatusCode.SUCCESS) {
+              wrappedCallback.onFailure(new CelebornIOException("Write data failed!"))
+            } else {
+              // Primary write succeeded, replication is happening asynchronously
+              wrappedCallback.onSuccess(ByteBuffer.wrap(Array[Byte]()))
+            }
+          case Failure(e) => wrappedCallback.onFailure(e)
+        }
       }
     } else {
       Try(Await.result(writePromise.future, Duration.Inf)) match {

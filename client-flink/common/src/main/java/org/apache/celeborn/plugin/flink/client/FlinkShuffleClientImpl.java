@@ -479,7 +479,7 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
     // add inFlight requests
     pushState.addBatch(nextBatchId, location.hostAndPushPort());
 
-    // build PushData request
+    // build PushData request - always use PRIMARY_MODE for asynchronous replication
     NettyManagedBuffer buffer = new NettyManagedBuffer(data);
     final String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
     PushData pushData = new PushData(PRIMARY_MODE, shuffleKey, location.getUniqueId(), buffer);
