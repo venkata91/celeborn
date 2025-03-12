@@ -84,6 +84,10 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
 
   /** The buffer size bytes in flink, default value is 32KB. */
   private final int bufferSizeBytes;
+  
+  // Constants for primary and replica modes
+  protected static final byte PRIMARY_MODE = PartitionLocation.Mode.PRIMARY.mode();
+  protected static final byte REPLICA_MODE = PartitionLocation.Mode.REPLICA.mode();
 
   public static FlinkShuffleClientImpl get(
       String appUniqueId,
@@ -101,6 +105,44 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
         conf,
         userIdentifier,
         TransportFrameDecoderWithBufferSupplier.DISABLE_LARGE_BUFFER_SPLIT_SIZE);
+  }
+
+  /**
+   * Register map partition task with replication support.
+   * This method requests both primary and replica locations from the LifecycleManager.
+   */
+  public Pair<PartitionLocation, PartitionLocation> registerMapPartitionTaskWithReplication(
+      int shuffleId, int numMappers, int mapId, int attemptId, int partitionId)
+      throws IOException {
+    String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
+    logger.info(
+        "Register map partition task with replication for shuffle {} map {} attempt {} partition {}",
+        shuffleId, mapId, attemptId, partitionId);
+    
+    // Request both primary and replica locations
+    RegisterMapPartitionTask req = 
+        new RegisterMapPartitionTask(
+            appUniqueId, 
+            shuffleId, 
+            numMappers, 
+            mapId, 
+            attemptId, 
+            partitionId, 
+            true); // true indicates request with replication
+    
+    RegisterMapPartitionTaskResponse resp = 
+        (RegisterMapPartitionTaskResponse) 
+            askLifecycleManager(shuffleKey, "RegisterMapPartitionTask", req);
+    
+    PartitionLocation primary = resp.primaryLocation();
+    PartitionLocation replica = resp.replicaLocation();
+    
+    logger.info(
+        "Got map partition locations with replication for shuffle {} map {} attempt {} " +
+        "partition {}, primary: {}, replica: {}", 
+        shuffleId, mapId, attemptId, partitionId, primary, replica);
+    
+    return Pair.of(primary, replica);
   }
 
   public static FlinkShuffleClientImpl get(
@@ -303,6 +345,101 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
     return readClientHandler;
   }
 
+  /**
+   * Push data to the replica location.
+   */
+  public int pushDataToReplicaLocation(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int partitionId,
+      ByteBuf data,
+      PartitionLocation location,
+      Runnable closeCallBack)
+      throws IOException {
+    // mapKey
+    final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+
+    PushState pushState = getPushState(mapKey);
+
+    // increment batchId - use the same batchId as the primary for deduplication
+    final int nextBatchId = pushState.currentBatchId();
+    int totalLength = data.readableBytes();
+    data.markWriterIndex();
+    data.writerIndex(0);
+    data.writeInt(partitionId);
+    data.writeInt(attemptId);
+    data.writeInt(nextBatchId);
+    data.writeInt(totalLength - BATCH_HEADER_SIZE);
+    data.resetWriterIndex();
+    logger.debug(
+        "Do push data byteBuf to REPLICA size {} for app {} shuffle {} map {} attempt {} reduce {} batch {}.",
+        totalLength,
+        appUniqueId,
+        shuffleId,
+        mapId,
+        attemptId,
+        partitionId,
+        nextBatchId);
+    // check limit
+    limitMaxInFlight(mapKey, pushState, location.hostAndPushPort());
+
+    // add inFlight requests
+    pushState.addBatch(nextBatchId, location.hostAndPushPort());
+
+    // build PushData request
+    NettyManagedBuffer buffer = new NettyManagedBuffer(data);
+    final String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
+    PushData pushData = new PushData(REPLICA_MODE, shuffleKey, location.getUniqueId(), buffer);
+
+    // build callback
+    RpcResponseCallback callback =
+        new RpcResponseCallback() {
+          @Override
+          public void onSuccess(ByteBuffer response) {
+            pushState.removeBatch(nextBatchId, location.hostAndPushPort());
+            logger.debug(
+                "Push data byteBuf to REPLICA {} success for shuffle {} map {} attemptId {} batch {}.",
+                location.hostAndPushPort(),
+                shuffleId,
+                mapId,
+                attemptId,
+                nextBatchId);
+          }
+
+          @Override
+          public void onFailure(Throwable e) {
+            pushState.removeBatch(nextBatchId, location.hostAndPushPort());
+            if (pushState.exception.get() != null) {
+              return;
+            }
+            String errorMsg =
+                String.format(
+                    "Push data byteBuf to REPLICA %s failed for shuffle %d map %d attempt %d batch %d.",
+                    location.hostAndPushPort(), shuffleId, mapId, attemptId, nextBatchId);
+            pushState.exception.compareAndSet(null, new CelebornIOException(errorMsg, e));
+          }
+        };
+    // do push data
+    try {
+      TransportClient client = createClientWaitingInFlightRequest(location, mapKey, pushState);
+      client.pushData(pushData, pushDataTimeout, callback, closeCallBack);
+    } catch (Exception e) {
+      logger.error(
+          "Exception raised while pushing data byteBuf to REPLICA for shuffle {} map {} attempt {} partitionId {} batch {} location {}.",
+          shuffleId,
+          mapId,
+          attemptId,
+          partitionId,
+          nextBatchId,
+          location,
+          e);
+      callback.onFailure(
+          new CelebornIOException(StatusCode.PUSH_DATA_CREATE_CONNECTION_FAIL_REPLICA, e));
+    }
+    return totalLength;
+  }
+
   public int pushDataToLocation(
       int shuffleId,
       int mapId,
@@ -412,6 +549,59 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
     return currentClient.get(mapKey);
   }
 
+  /**
+   * Send handshake to the replica worker.
+   */
+  public Optional<PartitionLocation> pushDataHandShakeToReplica(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      int numPartitions,
+      int bufferSize,
+      PartitionLocation location)
+      throws IOException {
+    final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+    final PushState pushState = pushStates.computeIfAbsent(mapKey, (s) -> new PushState(conf));
+    return retrySendMessage(
+        () -> {
+          String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
+          logger.info(
+              "PushDataHandShake to replica for shuffleKey {} attemptId {} locationId {}",
+              shuffleKey,
+              attemptId,
+              location.getUniqueId());
+          logger.debug("PushDataHandShake to replica location {}", location);
+          TransportClient client = createClientWaitingInFlightRequest(location, mapKey, pushState);
+          ByteBuffer pushDataHandShakeResponse;
+          try {
+            pushDataHandShakeResponse =
+                client.sendRpcSync(
+                    new TransportMessage(
+                            MessageType.PUSH_DATA_HAND_SHAKE,
+                            PbPushDataHandShake.newBuilder()
+                                .setMode(Mode.forNumber(REPLICA_MODE)) // Use REPLICA mode
+                                .setShuffleKey(shuffleKey)
+                                .setPartitionUniqueId(location.getUniqueId())
+                                .setAttemptId(attemptId)
+                                .setNumPartitions(numPartitions)
+                                .setBufferSize(bufferSize)
+                                .build()
+                                .toByteArray())
+                        .toByteBuffer(),
+                    conf.pushDataTimeoutMs());
+          } catch (IOException e) {
+            // ioexeption revive
+            return revive(shuffleId, mapId, attemptId, location);
+          }
+          if (pushDataHandShakeResponse.hasRemaining()
+              && pushDataHandShakeResponse.get() == StatusCode.HARD_SPLIT.getValue()) {
+            // if split then revive
+            return revive(shuffleId, mapId, attemptId, location);
+          }
+          return Optional.empty();
+        });
+  }
+
   public Optional<PartitionLocation> pushDataHandShake(
       int shuffleId,
       int mapId,
@@ -455,6 +645,61 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
           }
           if (pushDataHandShakeResponse.hasRemaining()
               && pushDataHandShakeResponse.get() == StatusCode.HARD_SPLIT.getValue()) {
+            // if split then revive
+            return revive(shuffleId, mapId, attemptId, location);
+          }
+          return Optional.empty();
+        });
+  }
+
+  /**
+   * Send region start to the replica worker.
+   */
+  public Optional<PartitionLocation> regionStartReplica(
+      int shuffleId,
+      int mapId,
+      int attemptId,
+      PartitionLocation location,
+      int currentRegionIdx,
+      boolean isBroadcast)
+      throws IOException {
+    final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+    final PushState pushState = pushStates.computeIfAbsent(mapKey, (s) -> new PushState(conf));
+    return retrySendMessage(
+        () -> {
+          String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
+          logger.info(
+              "RegionStart for REPLICA shuffle {} regionId {} attemptId {} locationId {}.",
+              shuffleId,
+              currentRegionIdx,
+              attemptId,
+              location.getUniqueId());
+          logger.debug("RegionStart for REPLICA location {}.", location.toString());
+          TransportClient client = createClientWaitingInFlightRequest(location, mapKey, pushState);
+          ByteBuffer regionStartResponse;
+          try {
+            regionStartResponse =
+                client.sendRpcSync(
+                    new TransportMessage(
+                            MessageType.REGION_START,
+                            PbRegionStart.newBuilder()
+                                .setMode(Mode.forNumber(REPLICA_MODE)) // Use REPLICA mode
+                                .setShuffleKey(shuffleKey)
+                                .setPartitionUniqueId(location.getUniqueId())
+                                .setAttemptId(attemptId)
+                                .setCurrentRegionIndex(currentRegionIdx)
+                                .setIsBroadcast(isBroadcast)
+                                .build()
+                                .toByteArray())
+                        .toByteBuffer(),
+                    conf.pushDataTimeoutMs());
+          } catch (IOException e) {
+            // ioexeption revive
+            return revive(shuffleId, mapId, attemptId, location);
+          }
+
+          if (regionStartResponse.hasRemaining()
+              && regionStartResponse.get() == StatusCode.HARD_SPLIT.getValue()) {
             // if split then revive
             return revive(shuffleId, mapId, attemptId, location);
           }
@@ -552,6 +797,40 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
           location.getEpoch());
       throw new CelebornIOException("RegionStart revive failed");
     }
+  }
+
+  /**
+   * Send region finish to the replica worker.
+   */
+  public void regionFinishReplica(int shuffleId, int mapId, int attemptId, PartitionLocation location)
+      throws IOException {
+    final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
+    final PushState pushState = pushStates.computeIfAbsent(mapKey, (s) -> new PushState(conf));
+    retrySendMessage(
+        () -> {
+          final String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
+          logger.info(
+              "RegionFinish for REPLICA shuffle {} map {} attemptId {} locationId {}.",
+              shuffleId,
+              mapId,
+              attemptId,
+              location.getUniqueId());
+          logger.debug("RegionFinish for REPLICA location {}.", location);
+          TransportClient client = createClientWaitingInFlightRequest(location, mapKey, pushState);
+          client.sendRpcSync(
+              new TransportMessage(
+                      MessageType.REGION_FINISH,
+                      PbRegionFinish.newBuilder()
+                          .setMode(Mode.forNumber(REPLICA_MODE)) // Use REPLICA mode
+                          .setShuffleKey(shuffleKey)
+                          .setPartitionUniqueId(location.getUniqueId())
+                          .setAttemptId(attemptId)
+                          .build()
+                          .toByteArray())
+                  .toByteBuffer(),
+              conf.pushDataTimeoutMs());
+          return null;
+        });
   }
 
   public void regionFinish(int shuffleId, int mapId, int attemptId, PartitionLocation location)
@@ -682,6 +961,25 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
   }
 
   @Override
+  /**
+   * Send mapper end for the replica worker.
+   */
+  public void mapPartitionMapperEndReplica(
+      int shuffleId, int mapId, int attemptId, int numMappers, String locationId)
+      throws IOException {
+    logger.info("MapperEnd for REPLICA shuffle {} map {} attemptId {}.", shuffleId, mapId, attemptId);
+    try {
+      // For replica end, we still need to report to the lifecycle manager
+      MapPartitionMapperEnd req = new MapPartitionMapperEnd(
+          appUniqueId, shuffleId, mapId, attemptId, numMappers, locationId, true); // true for replica
+      lifecycleManagerRef.send(req);
+    } catch (Exception e) {
+      logger.error("Exception raised while REPLICA mapper ending for shuffle {} map {}.", 
+          shuffleId, mapId, e);
+      throw new CelebornIOException(e.getMessage(), e);
+    }
+  }
+  
   public void cleanup(int shuffleId, int mapId, int attemptId) {
     final String mapKey = Utils.makeMapKey(shuffleId, mapId, attemptId);
     super.cleanup(shuffleId, mapId, attemptId);

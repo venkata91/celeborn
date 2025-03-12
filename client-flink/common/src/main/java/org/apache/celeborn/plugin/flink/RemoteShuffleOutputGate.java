@@ -66,6 +66,8 @@ public class RemoteShuffleOutputGate {
   private CelebornConf celebornConf;
   private final int numMappers;
   private PartitionLocation partitionLocation;
+  // For replication: store the replica partition location
+  private PartitionLocation replicaPartitionLocation;
 
   private int currentRegionIndex = 0;
 
@@ -83,6 +85,10 @@ public class RemoteShuffleOutputGate {
   private boolean isRegisterShuffle = false;
   private int maxReviveTimes;
   private boolean hasSentHandshake = false;
+  // Track if we've sent handshake to replica
+  private boolean hasSentReplicaHandshake = false;
+  // For replication: flag to indicate if replication is enabled
+  private boolean replicationEnabled = false;
 
   /**
    * @param shuffleDesc Describes shuffle meta and shuffle worker address.
@@ -118,6 +124,10 @@ public class RemoteShuffleOutputGate {
         shuffleDesc.getShuffleResource().getLifecycleManagerTimestamp();
     this.flinkShuffleClient = getShuffleClient();
     this.maxReviveTimes = celebornConf.clientPushMaxReviveTimes();
+    
+    // Initialize replication flag from configuration
+    this.replicationEnabled = celebornConf.clientPushReplicateEnabled();
+    LOG.info("Flink shuffle replication is {}", replicationEnabled ? "enabled" : "disabled");
   }
 
   /** Initialize transportation gate. */
@@ -164,7 +174,14 @@ public class RemoteShuffleOutputGate {
   public void regionFinish() throws InterruptedException {
     bufferPacker.drain();
     try {
+      // Send region finish to primary
       flinkShuffleClient.regionFinish(shuffleId, mapId, attemptId, partitionLocation);
+      
+      // If replication is enabled, also send to replica
+      if (replicationEnabled && replicaPartitionLocation != null) {
+        flinkShuffleClient.regionFinishReplica(shuffleId, mapId, attemptId, replicaPartitionLocation);
+      }
+      
       currentRegionIndex++;
     } catch (IOException e) {
       Utils.rethrowAsRuntimeException(e);
@@ -173,8 +190,15 @@ public class RemoteShuffleOutputGate {
 
   /** Indicates the writing/spilling is finished. */
   public void finish() throws InterruptedException, IOException {
+    // Send mapper end to primary
     flinkShuffleClient.mapPartitionMapperEnd(
         shuffleId, mapId, attemptId, numMappers, partitionLocation.getId());
+        
+    // If replication is enabled, also send mapper end to replica
+    if (replicationEnabled && replicaPartitionLocation != null) {
+      flinkShuffleClient.mapPartitionMapperEndReplica(
+          shuffleId, mapId, attemptId, numMappers, replicaPartitionLocation.getId());
+    }
   }
 
   /** Close the transportation gate. */
@@ -210,14 +234,38 @@ public class RemoteShuffleOutputGate {
   /** Writes a piece of data to a subpartition. */
   public void write(ByteBuf byteBuf, BufferHeader bufferHeader) {
     try {
-      flinkShuffleClient.pushDataToLocation(
-          shuffleId,
-          mapId,
-          attemptId,
-          bufferHeader.getSubPartitionId(),
-          io.netty.buffer.Unpooled.wrappedBuffer(byteBuf.nioBuffer()),
-          partitionLocation,
-          () -> byteBuf.release());
+      if (replicationEnabled && replicaPartitionLocation != null) {
+        // When replication is enabled, write to both primary and replica synchronously
+        // First write to primary
+        flinkShuffleClient.pushDataToLocation(
+            shuffleId,
+            mapId,
+            attemptId,
+            bufferHeader.getSubPartitionId(),
+            io.netty.buffer.Unpooled.wrappedBuffer(byteBuf.nioBuffer()),
+            partitionLocation,
+            null); // Don't release yet, we still need to send to replica
+            
+        // Then write to replica synchronously
+        flinkShuffleClient.pushDataToReplicaLocation(
+            shuffleId,
+            mapId,
+            attemptId,
+            bufferHeader.getSubPartitionId(),
+            io.netty.buffer.Unpooled.wrappedBuffer(byteBuf.nioBuffer()),
+            replicaPartitionLocation,
+            () -> byteBuf.release());
+      } else {
+        // Original code path when replication is disabled
+        flinkShuffleClient.pushDataToLocation(
+            shuffleId,
+            mapId,
+            attemptId,
+            bufferHeader.getSubPartitionId(),
+            io.netty.buffer.Unpooled.wrappedBuffer(byteBuf.nioBuffer()),
+            partitionLocation,
+            () -> byteBuf.release());
+      }
     } catch (IOException e) {
       Utils.rethrowAsRuntimeException(e);
     }
@@ -225,10 +273,24 @@ public class RemoteShuffleOutputGate {
 
   public void registerShuffle() throws IOException {
     if (!isRegisterShuffle) {
-      partitionLocation =
-          flinkShuffleClient.registerMapPartitionTask(
-              shuffleId, numMappers, mapId, attemptId, partitionId);
-      Utils.checkNotNull(partitionLocation);
+      if (replicationEnabled) {
+        // When replication is enabled, we need to register with replication flag
+        Pair<PartitionLocation, PartitionLocation> locations =
+            flinkShuffleClient.registerMapPartitionTaskWithReplication(
+                shuffleId, numMappers, mapId, attemptId, partitionId);
+        partitionLocation = locations.getLeft();
+        replicaPartitionLocation = locations.getRight();
+        Utils.checkNotNull(partitionLocation);
+        Utils.checkNotNull(replicaPartitionLocation);
+        LOG.info("Registered shuffle with replication, primary: {}, replica: {}", 
+            partitionLocation, replicaPartitionLocation);
+      } else {
+        // Original code path when replication is disabled
+        partitionLocation =
+            flinkShuffleClient.registerMapPartitionTask(
+                shuffleId, numMappers, mapId, attemptId, partitionId);
+        Utils.checkNotNull(partitionLocation);
+      }
 
       currentRegionIndex = 0;
       isRegisterShuffle = true;
@@ -237,6 +299,7 @@ public class RemoteShuffleOutputGate {
 
   public void regionStartWithRevive(boolean isBroadcast) {
     try {
+      // Primary region start
       int remainingReviveTimes = maxReviveTimes;
       boolean hasSentRegionStart = false;
       while (remainingReviveTimes-- > 0 && !hasSentRegionStart) {
@@ -268,6 +331,41 @@ public class RemoteShuffleOutputGate {
         throw new RuntimeException(
             "After retry " + maxReviveTimes + " times, still failed to send regionStart");
       }
+
+      // Replica region start (if replication is enabled)
+      if (replicationEnabled && replicaPartitionLocation != null) {
+        remainingReviveTimes = maxReviveTimes;
+        boolean hasSentReplicaRegionStart = false;
+        while (remainingReviveTimes-- > 0 && !hasSentReplicaRegionStart) {
+          Optional<PartitionLocation> revivePartition =
+              flinkShuffleClient.regionStartReplica(
+                  shuffleId, mapId, attemptId, replicaPartitionLocation, currentRegionIndex, isBroadcast);
+          if (revivePartition.isPresent()) {
+            LOG.info(
+                "Revive at replica regionStart, currentTimes:{}, totalTimes:{} for shuffleId:{}, mapId:{}, attempId:{}, currentRegionIndex:{}, isBroadcast:{}, newPartition:{}, oldPartition:{}",
+                remainingReviveTimes,
+                maxReviveTimes,
+                shuffleId,
+                mapId,
+                attemptId,
+                currentRegionIndex,
+                isBroadcast,
+                revivePartition,
+                replicaPartitionLocation);
+            replicaPartitionLocation = revivePartition.get();
+            hasSentReplicaRegionStart = false;
+            // For every revive partition, handshake should be sent firstly
+            hasSentReplicaHandshake = false;
+            handshake();
+          } else {
+            hasSentReplicaRegionStart = true;
+          }
+        }
+        if (remainingReviveTimes == 0 && !hasSentReplicaRegionStart) {
+          throw new RuntimeException(
+              "After retry " + maxReviveTimes + " times, still failed to send replica regionStart");
+        }
+      }
     } catch (IOException e) {
       Utils.rethrowAsRuntimeException(e);
     }
@@ -275,6 +373,7 @@ public class RemoteShuffleOutputGate {
 
   public void handshake() {
     try {
+      // Primary handshake
       int remainingReviveTimes = maxReviveTimes;
       while (remainingReviveTimes-- > 0 && !hasSentHandshake) {
         Optional<PartitionLocation> revivePartition =
@@ -302,6 +401,36 @@ public class RemoteShuffleOutputGate {
       if (remainingReviveTimes == 0 && !hasSentHandshake) {
         throw new RuntimeException(
             "After retry " + maxReviveTimes + " times, still failed to send handshake");
+      }
+      
+      // Replica handshake (only if replication is enabled)
+      if (replicationEnabled && replicaPartitionLocation != null) {
+        remainingReviveTimes = maxReviveTimes;
+        while (remainingReviveTimes-- > 0 && !hasSentReplicaHandshake) {
+          Optional<PartitionLocation> revivePartition =
+              flinkShuffleClient.pushDataHandShakeToReplica(
+                  shuffleId, mapId, attemptId, numSubs, bufferSize, replicaPartitionLocation);
+          if (revivePartition.isPresent() && remainingReviveTimes > 0) {
+            LOG.info(
+                "Revive at replica handshake, currentTimes:{}, totalTimes:{} for shuffleId:{}, mapId:{}, attempId:{}, currentRegionIndex:{}, newPartition:{}, oldPartition:{}",
+                remainingReviveTimes,
+                maxReviveTimes,
+                shuffleId,
+                mapId,
+                attemptId,
+                currentRegionIndex,
+                revivePartition,
+                replicaPartitionLocation);
+            replicaPartitionLocation = revivePartition.get();
+            hasSentReplicaHandshake = false;
+          } else {
+            hasSentReplicaHandshake = true;
+          }
+        }
+        if (remainingReviveTimes == 0 && !hasSentReplicaHandshake) {
+          throw new RuntimeException(
+              "After retry " + maxReviveTimes + " times, still failed to send replica handshake");
+        }
       }
     } catch (IOException e) {
       Utils.rethrowAsRuntimeException(e);
