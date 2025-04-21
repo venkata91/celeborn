@@ -83,7 +83,6 @@ public class RemoteShuffleResultPartitionDelegation {
       Function<Buffer, Boolean> canBeCompressed,
       Runnable checkProduceState)
       throws IOException {
-    LOG.info("Setup {}", this);
     this.bufferPool = bufferPool;
     this.bufferCompressor = bufferCompressor;
     this.canBeCompressed = canBeCompressed;

@@ -425,7 +425,7 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
     return retrySendMessage(
         () -> {
           String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
-          logger.info(
+          logger.debug(
               "PushDataHandShake shuffleKey {} attemptId {} locationId {}",
               shuffleKey,
               attemptId,
@@ -475,13 +475,13 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
     return retrySendMessage(
         () -> {
           String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
-          logger.info(
+          logger.debug(
               "RegionStart for shuffle {} regionId {} attemptId {} locationId {}.",
               shuffleId,
               currentRegionIdx,
               attemptId,
               location.getUniqueId());
-          logger.debug("RegionStart  for location {}.", location.toString());
+          logger.debug("RegionStart  for location {}.", location);
           TransportClient client = createClientWaitingInFlightRequest(location, mapKey, pushState);
           ByteBuffer regionStartResponse;
           try {
@@ -561,7 +561,7 @@ public class FlinkShuffleClientImpl extends ShuffleClientImpl {
     retrySendMessage(
         () -> {
           final String shuffleKey = Utils.makeShuffleKey(appUniqueId, shuffleId);
-          logger.info(
+          logger.debug(
               "RegionFinish for shuffle {} map {} attemptId {} locationId {}.",
               shuffleId,
               mapId,
