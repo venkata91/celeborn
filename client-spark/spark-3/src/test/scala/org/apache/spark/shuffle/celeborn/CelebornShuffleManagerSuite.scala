@@ -93,6 +93,20 @@ class SparkShuffleManagerSuite extends Logging {
   }
 
   @junit.Test
+  def testReliableStorageFollowsFallbackPolicy(): Unit = {
+    // supportsReliableStorage must be true only for NEVER; AUTO/ALWAYS may fall back to local-disk
+    // shuffle, so reporting reliable storage would let DRA reclaim executors holding fallback data.
+    def reliable(policy: String): Boolean = {
+      val conf = new SparkConf()
+        .set(s"spark.${CelebornConf.SPARK_SHUFFLE_FALLBACK_POLICY.key}", policy)
+      new CelebornShuffleDataIO(conf).driver().supportsReliableStorage()
+    }
+    Assert.assertTrue(reliable("NEVER"))
+    Assert.assertFalse(reliable("AUTO"))
+    Assert.assertFalse(reliable("ALWAYS"))
+  }
+
+  @junit.Test
   def testWrongSparkConfMaxAttemptLimit(): Unit = {
     val conf = new SparkConf().setIfMissing("spark.master", "local")
       .setIfMissing(

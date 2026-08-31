@@ -36,6 +36,7 @@ import org.apache.celeborn.client.LifecycleManager;
 import org.apache.celeborn.client.ShuffleClient;
 import org.apache.celeborn.client.security.CryptoHandler;
 import org.apache.celeborn.common.CelebornConf;
+import org.apache.celeborn.common.protocol.FallbackPolicy;
 import org.apache.celeborn.common.protocol.ShuffleMode;
 import org.apache.celeborn.reflect.DynMethods;
 import org.apache.celeborn.spark.FailedShuffleCleaner;
@@ -117,21 +118,32 @@ public class SparkShuffleManager implements ShuffleManager {
               + "use Celeborn as Remote Shuffle Service to avoid performance degradation.",
           SQLConf.LOCAL_SHUFFLE_READER_ENABLED().key());
     }
-    if ((Boolean) conf.get(package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED())) {
-      String key = package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED().key();
-      Boolean defaultValue =
-          (Boolean) package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED().defaultValue().get();
+    this.celebornConf = SparkUtils.fromSparkConf(conf);
+    boolean shuffleTrackingEnabled =
+        (Boolean) conf.get(package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED());
+    boolean draWithoutShuffleService =
+        conf.getBoolean("spark.dynamicAllocation.enabled", false)
+            && !conf.getBoolean("spark.shuffle.service.enabled", false);
+    boolean neverFallback =
+        FallbackPolicy.NEVER.equals(celebornConf.sparkShuffleFallbackPolicy());
+    if (draWithoutShuffleService && !neverFallback && !shuffleTrackingEnabled) {
+      // Under AUTO/ALWAYS a shuffle can fall back to local-disk shuffle, so DRA needs shuffle
+      // tracking to avoid reclaiming executors that hold fallback output (FetchFailed).
       logger.warn(
-          "Detected {} (default is {}) is enabled, "
-              + "it's highly recommended to disable it when use Celeborn as Remote Shuffle Service "
-              + "to avoid performance degradation.",
-          key,
-          defaultValue);
+          "{} is disabled while DRA is on without the external shuffle service and the fallback "
+              + "policy is not NEVER; enable it so fallback shuffle output is tracked.",
+          package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED().key());
+    } else if (neverFallback && shuffleTrackingEnabled) {
+      // NEVER keeps all shuffle on Celeborn's reliable storage, so tracking is pure overhead.
+      logger.warn(
+          "Detected {} is enabled, it's highly recommended to disable it when use Celeborn as "
+              + "Remote Shuffle Service with fallback policy NEVER to avoid performance "
+              + "degradation.",
+          package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED().key());
     }
     SparkCommonUtils.validateAttemptConfig(conf);
     this.conf = conf;
     this.isDriver = isDriver;
-    this.celebornConf = SparkUtils.fromSparkConf(conf);
     this.cores = executorCores(conf);
     this.fallbackPolicyRunner = new CelebornShuffleFallbackPolicyRunner(celebornConf);
     this.sendBufferPoolCheckInterval = celebornConf.clientPushSendBufferPoolExpireCheckInterval();
@@ -221,12 +233,16 @@ public class SparkShuffleManager implements ShuffleManager {
     lifecycleManager.shuffleCount().increment();
     if (fallbackPolicyRunner.applyFallbackPolicies(dependency, lifecycleManager)) {
       if (conf.getBoolean("spark.dynamicAllocation.enabled", false)
-          && !conf.getBoolean("spark.shuffle.service.enabled", false)) {
+          && !conf.getBoolean("spark.shuffle.service.enabled", false)
+          && !(Boolean) conf.get(package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED())) {
+        // Fallback output lives on the executor's local disk. Without shuffle tracking DRA can
+        // reclaim that executor and cause FetchFailed. With tracking on, the fallback is safe.
         logger.error(
             "DRA is enabled but we fallback to vanilla Spark SortShuffleManager for "
-                + "shuffle: {} due to fallback policy. It may cause block can not found when reducer "
-                + "task fetch data.",
-            shuffleId);
+                + "shuffle: {} due to fallback policy, and {} is disabled. It may cause block can "
+                + "not be found when a reducer task fetches data.",
+            shuffleId,
+            package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED().key());
       } else {
         logger.warn("Fallback to vanilla Spark SortShuffleManager for shuffle: {}", shuffleId);
       }

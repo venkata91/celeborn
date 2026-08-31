@@ -27,6 +27,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.celeborn.common.CelebornConf;
+import org.apache.celeborn.common.protocol.FallbackPolicy;
 
 public class CelebornShuffleDataIO implements ShuffleDataIO {
 
@@ -58,7 +59,12 @@ class CelebornShuffleDriverComponents extends LocalDiskShuffleDriverComponents {
   private final boolean supportsReliableStorage;
 
   public CelebornShuffleDriverComponents(CelebornConf celebornConf) {
-    this.supportsReliableStorage = !celebornConf.shuffleForceFallbackEnabled();
+    // Only NEVER keeps every shuffle on Celeborn's reliable storage. Under AUTO/ALWAYS a shuffle
+    // can fall back to the local-disk SortShuffleManager, whose output dies with the executor, so
+    // we report false: that makes Spark's ExecutorAllocationManager require shuffle tracking (or a
+    // shuffle service) under DRA instead of reclaiming executors that hold fallback output.
+    this.supportsReliableStorage =
+        FallbackPolicy.NEVER.equals(celebornConf.sparkShuffleFallbackPolicy());
   }
 
   // Omitting @Override annotation to avoid compile error before Spark 3.5.0
