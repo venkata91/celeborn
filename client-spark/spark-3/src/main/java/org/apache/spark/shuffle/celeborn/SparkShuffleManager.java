@@ -124,21 +124,20 @@ public class SparkShuffleManager implements ShuffleManager {
     boolean draWithoutShuffleService =
         conf.getBoolean("spark.dynamicAllocation.enabled", false)
             && !conf.getBoolean("spark.shuffle.service.enabled", false);
-    boolean neverFallback =
-        FallbackPolicy.NEVER.equals(celebornConf.sparkShuffleFallbackPolicy());
+    boolean neverFallback = FallbackPolicy.NEVER.equals(celebornConf.sparkShuffleFallbackPolicy());
     if (draWithoutShuffleService && !neverFallback && !shuffleTrackingEnabled) {
-      // Under AUTO/ALWAYS a shuffle can fall back to local-disk shuffle, so DRA needs shuffle
-      // tracking to avoid reclaiming executors that hold fallback output (FetchFailed).
+      // Fallback output lives on the executor's local disk; without tracking, DRA can reclaim
+      // that executor and lose it. Spark also fails this config fast (see supportsReliableStorage).
       logger.warn(
-          "{} is disabled while DRA is on without the external shuffle service and the fallback "
-              + "policy is not NEVER; enable it so fallback shuffle output is tracked.",
+          "DRA is enabled without the external shuffle service and fallback policy is not NEVER, "
+              + "but {} is disabled. Enable it so fallback shuffle output is not lost when idle "
+              + "executors are reclaimed.",
           package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED().key());
     } else if (neverFallback && shuffleTrackingEnabled) {
-      // NEVER keeps all shuffle on Celeborn's reliable storage, so tracking is pure overhead.
+      // Under NEVER all shuffle stays on Celeborn, so tracking only delays releasing executors.
       logger.warn(
-          "Detected {} is enabled, it's highly recommended to disable it when use Celeborn as "
-              + "Remote Shuffle Service with fallback policy NEVER to avoid performance "
-              + "degradation.",
+          "{} is enabled with fallback policy NEVER; it is unnecessary and delays releasing idle "
+              + "executors, so it is recommended to disable it.",
           package$.MODULE$.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED().key());
     }
     SparkCommonUtils.validateAttemptConfig(conf);
