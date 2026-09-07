@@ -18,10 +18,13 @@
 package org.apache.celeborn.common.network;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.*;
 
 import java.nio.ByteBuffer;
 
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.local.LocalChannel;
 import org.junit.Test;
@@ -30,9 +33,11 @@ import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.network.buffer.NioManagedBuffer;
 import org.apache.celeborn.common.network.client.ChunkReceivedCallback;
 import org.apache.celeborn.common.network.client.RpcResponseCallback;
+import org.apache.celeborn.common.network.client.TransportClient;
 import org.apache.celeborn.common.network.client.TransportResponseHandler;
 import org.apache.celeborn.common.network.protocol.*;
 import org.apache.celeborn.common.protocol.TransportModuleConstants;
+import org.apache.celeborn.common.protocol.message.StatusCode;
 import org.apache.celeborn.common.read.FetchRequestInfo;
 import org.apache.celeborn.common.util.Utils;
 import org.apache.celeborn.common.write.PushRequestInfo;
@@ -173,6 +178,47 @@ public class TransportResponseHandlerSuiteJ {
 
     handler.handle(new RpcFailure(12345, "oh no"));
     verify(callback, times(1)).onFailure(any());
+    assertEquals(0, handler.numOutstandingRequests());
+  }
+
+  @Test
+  public void invalidateClientAfterPushTimeout() {
+    Channel channel = mock(Channel.class);
+    ChannelFuture closeFuture = mock(ChannelFuture.class);
+    when(channel.isOpen()).thenReturn(true);
+    when(channel.close()).thenReturn(closeFuture);
+
+    TransportResponseHandler handler =
+        new TransportResponseHandler(
+            Utils.fromCelebornConf(
+                new CelebornConf(), TransportModuleConstants.REPLICATE_MODULE, 8),
+            channel);
+    TransportClient client = new TransportClient(channel, handler);
+    RpcResponseCallback callback = mock(RpcResponseCallback.class);
+    doAnswer(
+            invocation -> {
+              assertFalse(client.isActive());
+              return null;
+            })
+        .when(callback)
+        .onFailure(any());
+    PushRequestInfo info =
+        new PushRequestInfo(System.currentTimeMillis() - 1, callback, client::invalidate);
+    ChannelFuture pushFuture = mock(ChannelFuture.class);
+    info.setChannelFuture(pushFuture);
+    handler.addPushRequest(12345, info);
+
+    assertTrue(client.isActive());
+    handler.failExpiredPushRequest();
+
+    assertFalse(client.isActive());
+    verify(pushFuture).cancel(true);
+    verify(channel).close();
+    verify(callback)
+        .onFailure(
+            argThat(
+                error ->
+                    error.getMessage().startsWith(StatusCode.PUSH_DATA_TIMEOUT_REPLICA.name())));
     assertEquals(0, handler.numOutstandingRequests());
   }
 }

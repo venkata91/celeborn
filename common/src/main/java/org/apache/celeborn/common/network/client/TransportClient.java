@@ -220,7 +220,7 @@ public class TransportClient implements Closeable {
 
     long requestId = requestId();
     long dueTime = System.currentTimeMillis() + pushDataTimeout;
-    PushRequestInfo info = new PushRequestInfo(dueTime, callback);
+    PushRequestInfo info = new PushRequestInfo(dueTime, callback, this::invalidate);
     handler.addPushRequest(requestId, info);
     pushData.requestId = requestId;
     PushChannelListener listener = new PushChannelListener(requestId, rpcSendoutCallback);
@@ -237,7 +237,7 @@ public class TransportClient implements Closeable {
 
     long requestId = requestId();
     long dueTime = System.currentTimeMillis() + pushDataTimeout;
-    PushRequestInfo info = new PushRequestInfo(dueTime, callback);
+    PushRequestInfo info = new PushRequestInfo(dueTime, callback, this::invalidate);
     handler.addPushRequest(requestId, info);
     pushMergedData.requestId = requestId;
 
@@ -348,6 +348,12 @@ public class TransportClient implements Closeable {
   /** Mark this channel as having timed out. */
   public void timeOut() {
     this.timedOut = true;
+  }
+
+  /** Invalidate this client and asynchronously close its channel. */
+  public void invalidate() {
+    this.timedOut = true;
+    channel.close();
   }
 
   @VisibleForTesting

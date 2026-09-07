@@ -185,6 +185,18 @@ public class TransportClientFactorySuiteJ {
   }
 
   @Test
+  public void neverReturnInvalidatedClients() throws IOException, InterruptedException {
+    TransportClientFactory factory = context.createClientFactory();
+    TransportClient c1 = factory.createClient(getLocalHost(), server1.getPort());
+    c1.invalidate();
+
+    TransportClient c2 = factory.createClient(getLocalHost(), server1.getPort());
+    assertNotSame(c1, c2);
+    assertTrue(c2.isActive());
+    factory.close();
+  }
+
+  @Test
   public void closeBlockClientsWithFactory() throws IOException, InterruptedException {
     TransportClientFactory factory = context.createClientFactory();
     TransportClient c1 = factory.createClient(getLocalHost(), server1.getPort());
