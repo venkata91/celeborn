@@ -350,8 +350,7 @@ public class TransportClient implements Closeable {
     this.timedOut = true;
   }
 
-  /** Invalidate this client and asynchronously close its channel. */
-  public void invalidate() {
+  private void invalidate() {
     this.timedOut = true;
     channel.close();
   }
