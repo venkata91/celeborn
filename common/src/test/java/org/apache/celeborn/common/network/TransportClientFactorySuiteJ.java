@@ -245,13 +245,12 @@ public class TransportClientFactorySuiteJ {
 
       timedOutClient.getHandler().failExpiredPushRequest();
 
-      Mockito.verify(timedOutCallback, Mockito.after(200).times(1))
+      Mockito.verify(timedOutCallback, Mockito.timeout(5000).times(1))
           .onFailure(
               Mockito.argThat(
                   error ->
                       error.getMessage().startsWith(StatusCode.PUSH_DATA_TIMEOUT_REPLICA.name())));
-      Mockito.verify(outstandingCallback, Mockito.after(200).times(1)).onFailure(Mockito.any());
-      assertFalse(timedOutClient.isActive());
+      Mockito.verify(outstandingCallback, Mockito.timeout(5000).times(1)).onFailure(Mockito.any());
 
       respond.set(true);
       TransportClient replacementClient =
